@@ -1,0 +1,6 @@
+venv/
+data/
+.vscode/
+*.pyc
+*.npz
+**wandb/
