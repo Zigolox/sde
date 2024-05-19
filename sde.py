@@ -6,7 +6,7 @@ import equinox as eqx
 import jax.numpy as jnp
 import optax
 import tensorflow_datasets as tfds
-from jax import Array, lax, nn, random, tree_map, vmap
+from jax import Array, lax, nn, random, vmap
 
 MNIST_SIZE = 784
 SEED = 0
@@ -43,12 +43,12 @@ class Solver(eqx.Module, abc.ABC):
         pass
 
     def __call__(self, x0: Array, key: Array):
-        x = vmap(self.model.start)(x0)
+        x_latent = vmap(self.model.start)(x0)
 
         def scan_step(carry: tuple[Array, float, Array], _) -> tuple[tuple[Array, float, Array], None]:
             return self.step(*carry), _
 
-        (x, *_), _ = lax.scan(scan_step, (x, self.t0, key), jnp.arange(self.t0, self.t1, self.dt))
+        (x, *_), _ = lax.scan(scan_step, (x_latent, self.t0, key), jnp.arange(self.t0, self.t1, self.dt))
 
         return vmap(self.model.end)(x)
 
@@ -58,8 +58,19 @@ class EulerSolver(Solver):
         return x + self.dt * self.model(x, t), t + self.dt, key
 
 
+class EulerMaruyamaSolver(Solver):
+    std: float = eqx.field(static=True)
+
+    def step(self, x: Array, t: float, key: Array) -> tuple[Array, float, Array]:
+        return x + self.dt * self.model(x, t) + self.std * random.normal(key, x.shape), t + self.dt, key
+
+
 def mse_loss(y_pred: Array, y_true: Array) -> Array:
     return jnp.mean(jnp.square(y_pred - y_true))
+
+
+def cross_entropy_loss(y_pred: Array, y_true: Array) -> Array:
+    return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(y_pred, y_true))
 
 
 def sample_data(x: Array, y: Array, batch_size: int, key: Array) -> tuple[Array, Array]:
@@ -67,57 +78,89 @@ def sample_data(x: Array, y: Array, batch_size: int, key: Array) -> tuple[Array,
     return x[random_indices], y[random_indices]
 
 
-def step(
-    solver: Solver, x: Array, y: Array, optim: optax.GradientTransformation, opt_state: optax.OptState, key: Array
+def train_step(
+    solver: Solver,
+    x: Array,
+    y: Array,
+    optim: optax.GradientTransformation,
+    opt_state: optax.OptState,
+    loss_fn: Callable[[Array, Array], Array],
+    key: Array,
 ) -> tuple[Solver, optax.OptState, Array]:
-    def loss_fn(solver: Solver, x: Array, y: Array) -> Array:
-        return mse_loss(solver(x, key), y)
+    def loss_wrapper(solver: Solver, x: Array, y: Array) -> Array:
+        return loss_fn(solver(x, key), y)
 
-    loss, grads = eqx.filter_value_and_grad(loss_fn)(solver, x, y)
+    loss, grads = eqx.filter_value_and_grad(loss_wrapper)(solver, x, y)
     updates, new_opt_state = optim.update(grads, opt_state)
     new_solver = eqx.apply_updates(solver, updates)
     return new_solver, new_opt_state, loss
 
 
+@eqx.filter_jit
 def train(
     init_solver: Solver,
     x: Array,
     y: Array,
     optim: optax.GradientTransformation,
+    loss_fn: Callable[[Array, Array], Array],
     batch_size: int,
     num_steps: int,
     key: Array,
 ) -> tuple[Solver, Array]:
-    init_params, static = eqx.partition(init_solver, eqx.is_array)
+    init_params, static = eqx.partition(init_solver, eqx.is_array_like)
 
     def scan_fn(carry: tuple[Solver, optax.OptState], key: Array) -> tuple[tuple[Solver, optax.OptState], Array]:
         params, opt_state = carry
         solver = eqx.combine(params, static)
 
         x_batch, y_batch = sample_data(x, y, batch_size, key)
-        new_solver, new_opt_state, loss = step(solver, x_batch, y_batch, optim, opt_state, key)
+        new_solver, new_opt_state, loss = train_step(solver, x_batch, y_batch, optim, opt_state, loss_fn, key)
 
-        return (eqx.filter(new_solver, eqx.is_array), new_opt_state), loss
+        return (eqx.filter(new_solver, eqx.is_array_like), new_opt_state), loss
 
     (params, _), loss = lax.scan(scan_fn, (init_params, optim.init(init_params)), random.split(key, num_steps))
     return eqx.combine(params, static), loss
 
 
+def load_data(split_name: str) -> tuple[Array, Array]:
+    mnist = tfds.load("mnist", split=split_name, as_supervised=True)
+    mnist_complete = next(iter(mnist.batch(len(mnist))))  # type: ignore
+    x, y = mnist_complete
+    # Flatten and normailize the image
+    x = jnp.reshape(jnp.asarray(x) / 255, (len(mnist), MNIST_SIZE))
+    return jnp.asarray(x, dtype=jnp.float32), jnp.asarray(y, dtype=jnp.int32)
+
+
+@eqx.filter_jit
+def test_solver(solver: Solver, x: Array, y: Array, key: Array, loss_fn: Callable[[Array, Array], Array]) -> Array:
+    y_pred = solver(x, key)
+    # round each value to the closest integer to allow continuous predictions
+    if loss_fn == cross_entropy_loss:
+        y_pred = jnp.argmax(y_pred, axis=-1)
+    y_pred = jnp.round(y_pred)
+    return jnp.mean(y_pred == y)
+
+
 def run_experiment():
     key = random.key(SEED)
 
-    mnist = tfds.load("mnist", split="train", as_supervised=True).batch(60000)  # type: ignore
-    mnist = next(iter(mnist))
-    x, y = tree_map(jnp.array, mnist)
-    x = jnp.reshape(x / 255, (60000, MNIST_SIZE))
+    x, y = load_data("train")
+    x_test, y_test = load_data("test")
 
-    model = Model(MNIST_SIZE, 64, 1, 10, key)
-    solver = EulerSolver(model=model, dt=0.01, t0=0.0, t1=1.0)
-
+    model = Model(MNIST_SIZE, latent_size=128, output_size=10, n_layers=10, key=key)
+    solver = EulerMaruyamaSolver(model=model, dt=0.01, t0=0.0, t1=1, std=0)
+    loss_fn = cross_entropy_loss
     optim = optax.adam(1e-4)
 
-    solver, losses = train(solver, x, y, optim, 100, 1000, key)
-    print(losses)
+    accuracy = test_solver(solver, x_test, y_test, key, loss_fn)
+    print("Initial accuracy:", accuracy)
+
+    fitted_solver, losses = train(solver, x, y, optim, loss_fn, 64, 3000, key)
+
+    accuracy = test_solver(fitted_solver, x_test, y_test, key, loss_fn)
+    print(f"Final loss: {losses[-1]}")
+    print(f"Accuracy: {accuracy}")
 
 
-run_experiment()
+if __name__ == "__main__":
+    run_experiment()
